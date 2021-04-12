@@ -89,7 +89,7 @@ type netlinkCalls interface {
 	getKubeDummyInterface() (netlink.Link, error)
 	setupRoutesForExternalIPForDSR(serviceInfoMap) error
 	setupPolicyRoutingForDSR() error
-	cleanupMangleTableRule(ip string, protocol string, port string, fwmark string) error
+	cleanupMangleTableRule(ip string, protocol string, port string, fwmark string, tcpMSS int) error
 }
 
 // LinuxNetworking interface contains all linux networking subsystem calls
@@ -236,6 +236,7 @@ type NetworkServicesController struct {
 	gracefulTermination bool
 	syncChan            chan int
 	dsr                 *dsrOpt
+	dsrTCPMSS           int
 }
 
 // DSR related options
@@ -1983,8 +1984,8 @@ const (
 	externalIPRouteTableName = "external_ip"
 )
 
-// setupMangleTableRule: setsup iptables rule to FWMARK the traffic to exteranl IP vip
-func setupMangleTableRule(ip string, protocol string, port string, fwmark string) error {
+// setupMangleTableRule: sets up iptables rule to FWMARK the traffic to external IP vip
+func setupMangleTableRule(ip string, protocol string, port string, fwmark string, tcpMSS int) error {
 	iptablesCmdHandler, err := iptables.New()
 	if err != nil {
 		return errors.New("Failed to initialize iptables executor" + err.Error())
@@ -2000,7 +2001,8 @@ func setupMangleTableRule(ip string, protocol string, port string, fwmark string
 	}
 
 	// setup iptables rule TCPMSS for DSR mode to fix mtu problem
-	mtuArgs := []string{"-d", ip, "-m", "tcp", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1440"}
+	mtuArgs := []string{"-d", ip, "-m", "tcp", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS",
+		"--set-mss", strconv.Itoa(tcpMSS)}
 	err = iptablesCmdHandler.AppendUnique("mangle", "PREROUTING", mtuArgs...)
 	if err != nil {
 		return errors.New("Failed to run iptables command to set up TCPMSS due to " + err.Error())
@@ -2013,7 +2015,7 @@ func setupMangleTableRule(ip string, protocol string, port string, fwmark string
 	return nil
 }
 
-func (ln *linuxNetworking) cleanupMangleTableRule(ip string, protocol string, port string, fwmark string) error {
+func (ln *linuxNetworking) cleanupMangleTableRule(ip string, protocol string, port string, fwmark string, tcpMSS int) error {
 	iptablesCmdHandler, err := iptables.New()
 	if err != nil {
 		return errors.New("Failed to initialize iptables executor" + err.Error())
@@ -2041,7 +2043,8 @@ func (ln *linuxNetworking) cleanupMangleTableRule(ip string, protocol string, po
 	}
 
 	// cleanup iptables rule TCPMSS
-	mtuArgs := []string{"-d", ip, "-m", "tcp", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1440"}
+	mtuArgs := []string{"-d", ip, "-m", "tcp", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS",
+		"--set-mss", strconv.Itoa(tcpMSS)}
 	exists, err = iptablesCmdHandler.Exists("mangle", "PREROUTING", mtuArgs...)
 	if err != nil {
 		return errors.New("Failed to cleanup iptables command to set up TCPMSS due to " + err.Error())
@@ -2494,6 +2497,14 @@ func NewNetworkServicesController(clientset kubernetes.Interface,
 		return nil, err
 	}
 	nsc.nodeIP = NodeIP
+	automtu, err := utils.GetMTUFromNodeIP(nsc.nodeIP, config.EnableOverlay)
+	if err != nil {
+		return nil, err
+	}
+	// Sets it to 20 bytes less than the auto-detected MTU to account for additional ip-ip headers needed for DSR, above
+	// method GetMTUFromNodeIP() already accounts for the overhead of ip-ip overlay networking, so we only need to
+	// remove 20 bytes
+	nsc.dsrTCPMSS = automtu - 20
 
 	nsc.podLister = podInformer.GetIndexer()
 
